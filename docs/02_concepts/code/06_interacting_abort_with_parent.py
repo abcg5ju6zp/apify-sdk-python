@@ -9,7 +9,7 @@ async def main() -> None:
         actor_run = await Actor.start(
             actor_id='apify/screenshot-url',
             run_input={'urls': [{'url': 'https://www.apify.com/'}]},
-            name='screenshot',
+            run_name='screenshot',
             abort_with_parent=True,
         )
 

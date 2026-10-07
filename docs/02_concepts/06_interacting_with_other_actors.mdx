@@ -43,7 +43,7 @@ The <ApiLink to="class/Actor#call">`Actor.call`</ApiLink> method starts another 
 
 When your Actor migrates to another server or is resurrected, it starts again from the beginning. An unnamed `Actor.start` or `Actor.call` then starts a second child run, and the first one keeps running with nobody waiting for it.
 
-To avoid the duplicate, pass a `name` to <ApiLink to="class/Actor#start">`Actor.start`</ApiLink> or <ApiLink to="class/Actor#call">`Actor.call`</ApiLink>. The name must be unique within your Actor run. Right after the child run starts, the SDK records its name and run ID under the `APIFY_CHILD_RUNS` key in the default key-value store. After a restart, the same call looks up the recorded run and reuses it based on its status:
+To avoid the duplicate, pass a `run_name` to <ApiLink to="class/Actor#start">`Actor.start`</ApiLink>, <ApiLink to="class/Actor#call">`Actor.call`</ApiLink> or <ApiLink to="class/Actor#call_task">`Actor.call_task`</ApiLink>. The name must be unique within your Actor run. Right after the child run starts, the SDK records its name and run ID under the `APIFY_CHILD_RUNS` key in the default key-value store. After a restart, the same call looks up the recorded run and reuses it based on its status:
 
 - `READY` or `RUNNING`: the call reattaches to the run.
 - `SUCCEEDED`: the call returns the run as is.
@@ -58,13 +58,13 @@ A named `Actor.call` that reattaches to a run streams only the log lines the chi
 
 Note that:
 
-- The name is bound to the `actor_id` you pass. Using the same name for a different Actor, or for the same Actor referenced by its ID instead of its name, raises a `ValueError`.
+- The name is bound to the `actor_id` or `task_id` you pass. Using the same name for a different Actor or task, or for the same Actor referenced by its ID instead of its name, raises a `ValueError`.
 - Concurrent calls under one name in the same Actor run share a single child run.
 - If your Actor is killed after the platform starts the child but before the SDK records it, the child run isn't recorded and the next attempt starts a new one.
 
 ### Listing child runs
 
-The <ApiLink to="class/Actor#child_runs">`Actor.child_runs`</ApiLink> method returns the named child runs of your Actor run by name, including those started before a migration or resurrection. Each entry has the run's current state as the API returns it, and the IDs of earlier runs under the same name that failed or went missing and were replaced. Runs started without a `name` aren't listed.
+The <ApiLink to="class/Actor#child_runs">`Actor.child_runs`</ApiLink> method returns the named child runs of your Actor run by name, including those started before a migration or resurrection. Each entry has the run's current state as the API returns it, and the IDs of earlier runs under the same name that failed or went missing and were replaced. Runs started without a `run_name` aren't listed.
 
 <RunnableCodeBlock className="language-python" language="python">
     {InteractingChildRunsExample}
@@ -81,7 +81,7 @@ When your Actor run is aborted, its child runs keep running, and you pay for the
 Note that:
 
 - The option is off by default, since aborting a child run throws away the work it hasn't finished.
-- It requires `name`. Without one, `Actor.start` and `Actor.call` raise a `ValueError`.
+- It requires `run_name`. Without one, `Actor.start`, `Actor.call` and `Actor.call_task` raise a `ValueError`.
 - Each call under a name records its own value, so the latest call decides whether the run is aborted.
 - A child run aborted this way ends as `ABORTED`. If your Actor run is resurrected later, the same named call resurrects the child run too.
 - Only a graceful abort gives the SDK time to act. A hard abort, a timeout, or a crash of your Actor run leaves the child runs running.
@@ -90,7 +90,7 @@ Note that:
 
 ### Limiting concurrent child runs
 
-An Actor that starts many child runs at once can hit the concurrency or memory limit of your account. To cap how many named child runs are active at once, call <ApiLink to="class/Actor#set_child_run_limits">`Actor.set_child_run_limits`</ApiLink>. While the limit is reached, a named `Actor.start` or `Actor.call` that would start or resurrect a run waits until one of the active child runs finishes. The SDK counts the child runs from the registry, so child runs started before a migration or resurrection count too.
+An Actor that starts many child runs at once can hit the concurrency or memory limit of your account. To cap how many named child runs are active at once, call <ApiLink to="class/Actor#set_child_run_limits">`Actor.set_child_run_limits`</ApiLink>. While the limit is reached, a named `Actor.start`, `Actor.call` or `Actor.call_task` that would start or resurrect a run waits until one of the active child runs finishes. The SDK counts the child runs from the registry, so child runs started before a migration or resurrection count too.
 
 <RunnableCodeBlock className="language-python" language="python">
     {InteractingChildRunLimitExample}
@@ -99,9 +99,9 @@ An Actor that starts many child runs at once can hit the concurrency or memory l
 Note that:
 
 - A child run counts as active while it's `READY`, `RUNNING`, `ABORTING` or `TIMING-OUT`.
-- Only named child runs count, and only named calls wait. A call without `name` starts its run right away.
+- Only named child runs count, and only named calls wait. A call without `run_name` starts its run right away.
 - Reattaching to an active child run never waits, since the run already holds a slot.
-- `Actor.call` frees the slot as soon as its run finishes. The SDK doesn't learn right away about a child run that nothing waits for, so it fetches the run again before counting it, once its status is more than 10 seconds old.
+- `Actor.call` and `Actor.call_task` free the slot as soon as their run finishes. The SDK doesn't learn right away about a child run that nothing waits for, so it fetches the run again before counting it, once its status is more than 10 seconds old.
 - The limit isn't persisted. After a migration or resurrection, call `Actor.set_child_run_limits` again before you start child runs.
 - Once your Actor run receives the `ABORTING` event, a call waiting for a slot raises a `RuntimeError` without starting its run.
 
@@ -120,7 +120,8 @@ Note that:
 - The charges of a failed child run stay reserved after a new run replaces it under the same name.
 - A reattached child run keeps the limit it was started with. A resurrected one gets a new limit, which can include the part it reserved before.
 - The reservations are stored in the registry, so they survive a migration or resurrection of your Actor run.
-- Child runs started without `name` aren't tracked, so they don't reserve any part of the budget.
+- Child runs started without `run_name` aren't tracked, so they don't reserve any part of the budget.
+- A task run can't be given a charge limit, so a named `Actor.call_task` that would start a new run raises a `RuntimeError`.
 - A limit that the platform sets by default, which it does for pay-per-event Actors, isn't shared. Only a limit set for the run counts.
 
 ## Actor call task

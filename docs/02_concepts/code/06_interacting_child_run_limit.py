@@ -16,7 +16,7 @@ async def main() -> None:
                 Actor.call(
                     actor_id='apify/screenshot-url',
                     run_input={'urls': [{'url': url}]},
-                    name=f'screenshot-{index}',
+                    run_name=f'screenshot-{index}',
                 )
                 for index, url in enumerate(urls)
             )

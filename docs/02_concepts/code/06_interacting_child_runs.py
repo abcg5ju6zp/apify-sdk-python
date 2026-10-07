@@ -10,7 +10,7 @@ async def main() -> None:
             await Actor.start(
                 actor_id='apify/screenshot-url',
                 run_input={'urls': [{'url': f'https://www.apify.com/?region={region}'}]},
-                name=f'screenshot-{region}',
+                run_name=f'screenshot-{region}',
             )
 
         # Count the child runs by their current status.

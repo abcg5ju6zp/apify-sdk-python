@@ -19,7 +19,7 @@ async def main() -> None:
                 Actor.call(
                     actor_id='apify/screenshot-url',
                     run_input={'urls': [{'url': f'https://www.apify.com/?page={page}'}]},
-                    name=f'screenshot-{page}',
+                    run_name=f'screenshot-{page}',
                     max_total_charge_usd=per_child,
                 )
                 for page in range(3)
