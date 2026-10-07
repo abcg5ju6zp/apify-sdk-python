@@ -1139,7 +1139,7 @@ async def test_named_start_gets_the_budget_left(apify_client_async_patcher: Apif
     """A named start without a charge limit gets the part of the parent's budget it has not charged itself."""
     async with Actor:
         await Actor.charge('some-event', count=3)
-        await Actor.start('some-actor', name='child')
+        await Actor.start('some-actor', run_name='child')
 
     assert started_limits(apify_client_async_patcher) == [Decimal(7)]
 
@@ -1159,7 +1159,7 @@ async def test_named_start_charge_limit_is_capped_at_the_budget_left(
 ) -> None:
     """An explicit charge limit of a named start is kept within the budget left and lowered above it."""
     async with Actor:
-        await Actor.start('some-actor', name='child', max_total_charge_usd=requested)
+        await Actor.start('some-actor', run_name='child', max_total_charge_usd=requested)
 
     assert started_limits(apify_client_async_patcher) == [expected]
 
@@ -1171,7 +1171,7 @@ async def test_unnamed_start_charge_limit_is_passed_through(
     """A start without a name is not tracked, so its charge limit is neither capped nor reserved."""
     async with Actor:
         await Actor.start('some-actor', max_total_charge_usd=Decimal(20))
-        await Actor.start('some-actor', name='child')
+        await Actor.start('some-actor', run_name='child')
 
     assert started_limits(apify_client_async_patcher) == [Decimal(20), Decimal(10)]
 
@@ -1183,8 +1183,8 @@ async def test_named_start_charge_limit_is_passed_through_without_a_parent_budge
     apify_client_async_patcher.patch('actor', 'start', return_value=make_run('new-run', 'READY'))
 
     async with Actor:
-        await Actor.start('some-actor', name='first', max_total_charge_usd=Decimal(20))
-        await Actor.start('some-actor', name='second')
+        await Actor.start('some-actor', run_name='first', max_total_charge_usd=Decimal(20))
+        await Actor.start('some-actor', run_name='second')
 
     assert started_limits(apify_client_async_patcher) == [Decimal(20), None]
 
@@ -1193,19 +1193,47 @@ async def test_named_start_charge_limit_is_passed_through_without_a_parent_budge
 async def test_running_child_run_reserves_its_charge_limit(apify_client_async_patcher: ApifyClientAsyncPatcher) -> None:
     """The limit of a running child run is reserved, both from later child runs and from the parent's own charges."""
     async with Actor:
-        await Actor.start('some-actor', name='first', max_total_charge_usd=Decimal(6))
+        await Actor.start('some-actor', run_name='first', max_total_charge_usd=Decimal(6))
         charge_result = await Actor.charge('some-event', count=3)
-        await Actor.start('some-actor', name='second')
+        await Actor.start('some-actor', run_name='second')
 
     assert charge_result.charged_count == 3
     assert started_limits(apify_client_async_patcher) == [Decimal(6), Decimal(1)]
 
 
 @pytest.mark.usefixtures('parent_budget')
+async def test_named_call_task_is_rejected_under_a_parent_budget(
+    apify_client_async_patcher: ApifyClientAsyncPatcher,
+) -> None:
+    """A named task call that would start a run under a parent budget set by the user raises without starting it."""
+    apify_client_async_patcher.patch('task', 'start', return_value=make_run('task-run', 'READY'))
+
+    async with Actor:
+        with pytest.raises(RuntimeError, match='cannot be given a part of the budget'):
+            await Actor.call_task('some-task', run_name='child')
+
+    assert apify_client_async_patcher.calls['task']['start'] == []
+
+
+async def test_named_call_task_starts_without_a_charge_limit(
+    apify_client_async_patcher: ApifyClientAsyncPatcher,
+) -> None:
+    """Without a parent budget, a named task call starts the task with the options the task client accepts."""
+    apify_client_async_patcher.patch('task', 'start', return_value=make_run('task-run', 'READY'))
+    apify_client_async_patcher.patch('run', 'wait_for_finish', return_value=make_run('task-run', 'SUCCEEDED'))
+
+    async with Actor:
+        await Actor.call_task('some-task', run_name='child')
+
+    [(_, kwargs)] = apify_client_async_patcher.calls['task']['start']
+    assert 'max_total_charge_usd' not in kwargs
+
+
+@pytest.mark.usefixtures('parent_budget')
 async def test_reserved_budget_limits_the_parent_charges() -> None:
     """The parent charges only the part of its budget not reserved for child runs."""
     async with Actor:
-        await Actor.start('some-actor', name='child', max_total_charge_usd=Decimal(6))
+        await Actor.start('some-actor', run_name='child', max_total_charge_usd=Decimal(6))
         charge_result = await Actor.charge('some-event', count=10)
 
     assert charge_result.charged_count == 4
@@ -1215,9 +1243,9 @@ async def test_reserved_budget_limits_the_parent_charges() -> None:
 async def test_exhausted_budget_rejects_a_named_start() -> None:
     """A named start raises when the whole parent budget is charged or reserved."""
     async with Actor:
-        await Actor.start('some-actor', name='first')
+        await Actor.start('some-actor', run_name='first')
         with pytest.raises(RuntimeError, match='budget of this Actor run is spent or reserved'):
-            await Actor.start('some-actor', name='second')
+            await Actor.start('some-actor', run_name='second')
 
 
 @pytest.mark.usefixtures('parent_budget')
@@ -1225,7 +1253,7 @@ async def test_concurrent_named_starts_share_the_budget() -> None:
     """Concurrent named starts reserve their limits one at a time, so together they stay within the budget."""
     async with Actor:
         results = await asyncio.gather(
-            *(Actor.start('some-actor', name=name, max_total_charge_usd=Decimal(6)) for name in ('a', 'b')),
+            *(Actor.start('some-actor', run_name=name, max_total_charge_usd=Decimal(6)) for name in ('a', 'b')),
             return_exceptions=True,
         )
         child_runs = await Actor.child_runs()
@@ -1240,11 +1268,11 @@ async def test_finished_child_run_releases_its_unused_budget(
     """A finished child run keeps only its charge reserved, and records it once it can no longer change."""
     monkeypatch.setattr('apify._child_runs._STATUS_MAX_AGE', timedelta(0))
     async with Actor:
-        first = await Actor.start('some-actor', name='first', max_total_charge_usd=Decimal(6))
+        first = await Actor.start('some-actor', run_name='first', max_total_charge_usd=Decimal(6))
         parent_budget[first.id] = finish(parent_budget[first.id], 'SUCCEEDED', 2)
-        await Actor.start('some-actor', name='second', max_total_charge_usd=Decimal(3))
+        await Actor.start('some-actor', run_name='second', max_total_charge_usd=Decimal(3))
         parent_budget['run-2'] = finish(parent_budget['run-2'], 'SUCCEEDED', 1, finished_ago=timedelta(minutes=5))
-        await Actor.start('some-actor', name='third')
+        await Actor.start('some-actor', run_name='third')
         kvs = await Actor.open_key_value_store()
         stored = await kvs.get_value(CHILD_RUNS_KEY)
 
@@ -1293,7 +1321,7 @@ async def test_resurrection_reuses_the_reservation_of_its_run(
         )
 
     async with _ActorType() as actor:
-        await actor.start('some-actor', name='child')
+        await actor.start('some-actor', run_name='child')
 
     [(_, kwargs)] = apify_client_async_patcher.calls['run']['resurrect']
     assert kwargs['max_total_charge_usd'] == Decimal(7)
@@ -1309,7 +1337,7 @@ async def test_replaced_failed_run_keeps_its_charge_reserved(
         await seed_budget_record('child', 'old-run', maxTotalChargeUsd='6')
 
     async with _ActorType() as actor:
-        await actor.start('some-actor', name='child')
+        await actor.start('some-actor', run_name='child')
         kvs = await actor.open_key_value_store()
         stored = await kvs.get_value(CHILD_RUNS_KEY)
 
@@ -1324,7 +1352,7 @@ async def test_failed_named_start_releases_its_reservation(apify_client_async_pa
     async with Actor:
         apify_client_async_patcher.patch('actor', 'start', replacement_method=Mock(side_effect=RuntimeError('boom')))
         with pytest.raises(RuntimeError, match='boom'):
-            await Actor.start('some-actor', name='child')
+            await Actor.start('some-actor', run_name='child')
         charge_result = await Actor.charge('some-event', count=10)
 
     assert charge_result.charged_count == 10
@@ -1346,7 +1374,7 @@ async def test_named_start_in_flight_reserves_its_limit(
 
     async with Actor:
         apify_client_async_patcher.patch('actor', 'start', replacement_method=start)
-        start_task = asyncio.create_task(Actor.start('some-actor', name='first'))
+        start_task = asyncio.create_task(Actor.start('some-actor', run_name='first'))
         await started.wait()
         charge_result = await Actor.charge('some-event', count=1)
         release.set()
@@ -1358,7 +1386,7 @@ async def test_named_start_in_flight_reserves_its_limit(
 async def test_listing_child_runs_releases_the_unused_budget(parent_budget: dict[str, Run]) -> None:
     """Listing the child runs releases the unused limit of those that finished."""
     async with Actor:
-        run = await Actor.start('some-actor', name='child', max_total_charge_usd=Decimal(6))
+        run = await Actor.start('some-actor', run_name='child', max_total_charge_usd=Decimal(6))
         parent_budget[run.id] = finish(parent_budget[run.id], 'SUCCEEDED', 2)
         await Actor.child_runs()
         charge_result = await Actor.charge('some-event', count=10)
@@ -1377,7 +1405,7 @@ async def test_named_call_releases_the_unused_budget_when_the_run_finishes(
     )
 
     async with Actor:
-        await Actor.call('some-actor', name='child', max_total_charge_usd=Decimal(6), logger=None)
+        await Actor.call('some-actor', run_name='child', max_total_charge_usd=Decimal(6), logger=None)
         charge_result = await Actor.charge('some-event', count=10)
 
     assert charge_result.charged_count == 8
@@ -1393,8 +1421,8 @@ async def test_platform_default_charge_limit_is_not_shared_with_child_runs(
     )
 
     async with Actor:
-        await Actor.start('some-actor', name='first')
-        await Actor.start('some-actor', name='second', max_total_charge_usd=Decimal(20))
+        await Actor.start('some-actor', run_name='first')
+        await Actor.start('some-actor', run_name='second', max_total_charge_usd=Decimal(20))
         charge_result = await Actor.charge('some-event', count=10)
 
     assert started_limits(apify_client_async_patcher) == [None, Decimal(20)]
@@ -1430,7 +1458,7 @@ async def test_run_fetched_before_its_resurrection_keeps_the_reservation(
     async with _ActorType() as actor:
         list_task = asyncio.create_task(actor.child_runs())
         await listing.wait()
-        await actor.start('some-actor', name='child')
+        await actor.start('some-actor', run_name='child')
         release.set()
         await list_task
         charge_result = await actor.charge('some-event', count=10)
@@ -1457,7 +1485,7 @@ async def test_resurrection_in_flight_reserves_its_limit_once(
     apify_client_async_patcher.patch('run', 'resurrect', replacement_method=resurrect, is_async=True)
 
     async with _ActorType() as actor:
-        start_task = asyncio.create_task(actor.start('some-actor', name='child', max_total_charge_usd=Decimal(4)))
+        start_task = asyncio.create_task(actor.start('some-actor', run_name='child', max_total_charge_usd=Decimal(4)))
         await started.wait()
         charge_result = await actor.charge('some-event', count=10)
         release.set()
@@ -1479,7 +1507,7 @@ async def test_failed_resurrection_leaves_the_charge_of_its_run_to_settle(
 
     async with _ActorType() as actor:
         with pytest.raises(RuntimeError, match='boom'):
-            await actor.start('some-actor', name='child')
+            await actor.start('some-actor', run_name='child')
         monkeypatch.setattr('apify._child_runs._CHARGE_SETTLE_TIME', timedelta(0))
         await actor.child_runs()
         kvs = await actor.open_key_value_store()

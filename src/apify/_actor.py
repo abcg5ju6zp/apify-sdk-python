@@ -973,8 +973,8 @@ class _ActorType:
             content_type: The content type of the input.
             build: Specifies the Actor build to run. It can be either a build tag or build number. By default,
                 the run uses the build specified in the default run configuration for the Actor (typically latest).
-            max_total_charge_usd: A limit on the total charged amount for pay-per-event Actors. When `name` is set
-                and this Actor run was started with a `max_total_charge_usd` set by the user, the limit defaults to
+            max_total_charge_usd: A limit on the total charged amount for pay-per-event Actors. When `run_name` is
+                set and this Actor run was started with a `max_total_charge_usd` set by the user, the limit defaults to
                 the part of that budget not charged by this Actor run nor reserved for its other named child runs,
                 and a higher value is lowered to it. The limit stays reserved until the child run finishes and its
                 charge is known.
@@ -1115,8 +1115,8 @@ class _ActorType:
             content_type: The content type of the input.
             build: Specifies the Actor build to run. It can be either a build tag or build number. By default,
                 the run uses the build specified in the default run configuration for the Actor (typically latest).
-            max_total_charge_usd: A limit on the total charged amount for pay-per-event Actors. When `name` is set
-                and this Actor run was started with a `max_total_charge_usd` set by the user, the limit defaults to
+            max_total_charge_usd: A limit on the total charged amount for pay-per-event Actors. When `run_name` is
+                set and this Actor run was started with a `max_total_charge_usd` set by the user, the limit defaults to
                 the part of that budget not charged by this Actor run nor reserved for its other named child runs,
                 and a higher value is lowered to it. The limit stays reserved until the child run finishes and its
                 charge is known.
@@ -1349,7 +1349,9 @@ class _ActorType:
                 to the recorded run. A `SUCCEEDED` run is returned as is, an `ABORTED` or `TIMED-OUT` one is
                 resurrected, and a new run is started only when nothing is recorded under the name, or the recorded
                 run `FAILED` or no longer exists. The name is bound to `task_id` exactly as passed, so reusing it with
-                any other value, or for an Actor, raises a `ValueError`.
+                any other value, or for an Actor, raises a `ValueError`. When this Actor run was started with
+                a `max_total_charge_usd` set by the user, a named call that would start a new run raises
+                a `RuntimeError`, since the task's run cannot be given a part of that budget.
             abort_with_parent: If true, the child run is gracefully aborted when this Actor run is gracefully
                 aborted. It requires `run_name`, and the value is recorded under it, replacing the one from an earlier
                 call. A hard abort, a timeout or a crash of this Actor run leaves the child running.
@@ -1384,19 +1386,27 @@ class _ActorType:
                 wait_duration=wait,
             )
         else:
-            started_run, _ = await self._find_or_start_child_run(
-                run_name,
-                task_id=task_id,
-                client=client,
-                start_run=partial(
-                    task_client.start,
+
+            async def start_task_run(*, max_total_charge_usd: Decimal | None) -> Run:
+                if max_total_charge_usd is not None:
+                    raise RuntimeError(
+                        f'Child run "{run_name}" was not started, since a task run cannot be given a part of the '
+                        'budget of this Actor run.'
+                    )
+                return await task_client.start(
                     task_input=task_input,
                     build=build,
                     restart_on_error=restart_on_error,
                     memory_mbytes=memory_mbytes,
                     run_timeout=task_call_timeout,
                     webhooks=to_client_representations(webhooks),
-                ),
+                )
+
+            started_run, _ = await self._find_or_start_child_run(
+                run_name,
+                task_id=task_id,
+                client=client,
+                start_run=start_task_run,
                 build=build,
                 max_total_charge_usd=None,
                 restart_on_error=restart_on_error,

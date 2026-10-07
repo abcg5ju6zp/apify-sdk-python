@@ -187,9 +187,9 @@ async def test_named_child_runs_share_the_parent_budget(
 
             actor_id = Actor.configuration.actor_id or ''
             first = await Actor.start(
-                actor_id=actor_id, run_input={'is_child': True}, name='first', max_total_charge_usd=Decimal('0.25')
+                actor_id=actor_id, run_input={'is_child': True}, run_name='first', max_total_charge_usd=Decimal('0.25')
             )
-            second = await Actor.start(actor_id=actor_id, run_input={'is_child': True}, name='second')
+            second = await Actor.start(actor_id=actor_id, run_input={'is_child': True}, run_name='second')
             try:
                 limits = []
                 for run in (first, second):
