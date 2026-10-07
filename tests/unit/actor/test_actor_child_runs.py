@@ -1062,7 +1062,25 @@ async def test_named_call_frees_its_slot_when_the_run_finishes(
 
     async with Actor:
         Actor.set_child_run_limits(max_concurrent_runs=1)
-        await Actor.call('some-actor', name='first', logger=None)
-        await asyncio.wait_for(Actor.start('some-actor', name='second'), timeout=1)
+        await Actor.call('some-actor', run_name='first', logger=None)
+        await asyncio.wait_for(Actor.start('some-actor', run_name='second'), timeout=1)
 
     assert len(apify_client_async_patcher.calls['actor']['start']) == 2
+
+
+async def test_named_call_task_frees_its_slot_when_the_run_finishes(
+    apify_client_async_patcher: ApifyClientAsyncPatcher,
+) -> None:
+    """A task run awaited by a named task call to its end frees its slot without being fetched again."""
+    apify_client_async_patcher.patch('task', 'start', return_value=make_run('task-run', 'READY'))
+    apify_client_async_patcher.patch('actor', 'start', return_value=make_run('actor-run', 'READY'))
+    # A fetch would report the run as still running, so only the awaited status can free the slot.
+    apify_client_async_patcher.patch('run', 'get', return_value=make_run('task-run', 'RUNNING'))
+    apify_client_async_patcher.patch('run', 'wait_for_finish', return_value=make_run('task-run', 'SUCCEEDED'))
+
+    async with Actor:
+        Actor.set_child_run_limits(max_concurrent_runs=1)
+        await Actor.call_task('some-task', run_name='first')
+        await asyncio.wait_for(Actor.start('some-actor', run_name='second'), timeout=1)
+
+    assert len(apify_client_async_patcher.calls['actor']['start']) == 1

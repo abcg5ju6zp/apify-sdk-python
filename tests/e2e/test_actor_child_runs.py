@@ -153,7 +153,7 @@ async def test_named_child_runs_respect_the_concurrency_limit(
             Actor.set_child_run_limits(max_concurrent_runs=1)
             runs = await asyncio.gather(
                 *(
-                    Actor.call(actor_id=actor_id, run_input={'is_child': True}, name=f'child-{index}')
+                    Actor.call(actor_id=actor_id, run_input={'is_child': True}, run_name=f'child-{index}')
                     for index in range(2)
                 )
             )
