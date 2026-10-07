@@ -31,12 +31,12 @@ async def test_named_child_run_is_reattached_after_reboot(
             child_run_id = await Actor.get_value('child_run_id')
 
             if child_run_id is None:
-                run = await Actor.start(actor_id=actor_id, run_input={'is_child': True}, name='child')
+                run = await Actor.start(actor_id=actor_id, run_input={'is_child': True}, run_name='child')
                 await Actor.set_value('child_run_id', run.id)
                 await Actor.reboot()
                 return
 
-            run = await Actor.call(actor_id=actor_id, run_input={'is_child': True}, name='child')
+            run = await Actor.call(actor_id=actor_id, run_input={'is_child': True}, run_name='child')
             assert run is not None, 'run is None'
             assert run.id == child_run_id, f'run.id={run.id}, child_run_id={child_run_id}'
             assert run.status == 'SUCCEEDED', f'run.status={run.status}'
@@ -73,7 +73,7 @@ async def test_named_aborted_child_run_is_resurrected_after_reboot(
             child_run_id = await Actor.get_value('child_run_id')
 
             if child_run_id is None:
-                run = await Actor.start(actor_id=actor_id, run_input={'is_child': True}, name='child')
+                run = await Actor.start(actor_id=actor_id, run_input={'is_child': True}, run_name='child')
                 await Actor.set_value('child_run_id', run.id)
                 run_client = Actor.apify_client.run(run.id)
                 await run_client.abort()
@@ -83,7 +83,7 @@ async def test_named_aborted_child_run_is_resurrected_after_reboot(
                 await Actor.reboot()
                 return
 
-            run = await Actor.start(actor_id=actor_id, run_input={'is_child': True}, name='child')
+            run = await Actor.start(actor_id=actor_id, run_input={'is_child': True}, run_name='child')
             try:
                 assert run.id == child_run_id, f'run.id={run.id}, child_run_id={child_run_id}'
                 assert run.status in {'READY', 'RUNNING'}, f'run.status={run.status}'
@@ -112,7 +112,7 @@ async def test_named_child_run_is_aborted_with_parent(
                 return
 
             actor_id = Actor.configuration.actor_id or ''
-            await Actor.start(actor_id=actor_id, run_input={'is_child': True}, name='child', abort_with_parent=True)
+            await Actor.start(actor_id=actor_id, run_input={'is_child': True}, run_name='child', abort_with_parent=True)
             await asyncio.sleep(300)
 
     actor = await make_actor(label='child-run-abort-with-parent', main_func=main)
@@ -154,7 +154,7 @@ async def test_named_child_runs_respect_the_concurrency_limit(
             Actor.set_child_run_limits(max_concurrent_runs=1)
             runs = await asyncio.gather(
                 *(
-                    Actor.call(actor_id=actor_id, run_input={'is_child': True}, name=f'child-{index}')
+                    Actor.call(actor_id=actor_id, run_input={'is_child': True}, run_name=f'child-{index}')
                     for index in range(2)
                 )
             )
