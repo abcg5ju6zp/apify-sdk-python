@@ -521,21 +521,24 @@ async def test_child_runs_includes_run_started_in_this_attempt(
     [
         pytest.param('start', id='start'),
         pytest.param('call', id='call'),
+        pytest.param('call_task', id='call task'),
     ],
 )
-async def test_abort_with_parent_requires_name(
+async def test_abort_with_parent_requires_run_name(
     apify_client_async_patcher: ApifyClientAsyncPatcher, method: str
 ) -> None:
-    """`abort_with_parent` without a `name` raises before any run is started."""
-    apify_client_async_patcher.patch('actor', 'start', return_value=make_run('new-run', 'READY'))
-    apify_client_async_patcher.patch('actor', 'call', return_value=make_run('new-run', 'SUCCEEDED'))
+    """`abort_with_parent` without a `run_name` raises before any run is started."""
+    for resource in ('actor', 'task'):
+        apify_client_async_patcher.patch(resource, 'start', return_value=make_run('new-run', 'READY'))
+        apify_client_async_patcher.patch(resource, 'call', return_value=make_run('new-run', 'SUCCEEDED'))
 
     async with Actor:
         with pytest.raises(ValueError, match='requires `run_name`'):
-            await getattr(Actor, method)('some-actor', abort_with_parent=True)
+            await getattr(Actor, method)('some-id', abort_with_parent=True)
 
-    assert apify_client_async_patcher.calls['actor']['start'] == []
-    assert apify_client_async_patcher.calls['actor']['call'] == []
+    for resource in ('actor', 'task'):
+        assert apify_client_async_patcher.calls[resource]['start'] == []
+        assert apify_client_async_patcher.calls[resource]['call'] == []
 
 
 async def test_named_start_records_abort_with_parent(apify_client_async_patcher: ApifyClientAsyncPatcher) -> None:
@@ -544,6 +547,21 @@ async def test_named_start_records_abort_with_parent(apify_client_async_patcher:
 
     async with Actor:
         await Actor.start('some-actor', run_name='scrape-eu', abort_with_parent=True)
+        kvs = await Actor.open_key_value_store()
+        stored = await kvs.get_value(CHILD_RUNS_KEY)
+
+    assert stored['scrape-eu']['abortWithParent'] is True
+
+
+async def test_named_call_task_records_abort_with_parent(
+    apify_client_async_patcher: ApifyClientAsyncPatcher,
+) -> None:
+    """A named task call with `abort_with_parent` records the flag with the run."""
+    apify_client_async_patcher.patch('task', 'start', return_value=make_run('new-run', 'READY'))
+    apify_client_async_patcher.patch('run', 'wait_for_finish', return_value=make_run('new-run', 'SUCCEEDED'))
+
+    async with Actor:
+        await Actor.call_task('some-task', run_name='scrape-eu', abort_with_parent=True)
         kvs = await Actor.open_key_value_store()
         stored = await kvs.get_value(CHILD_RUNS_KEY)
 
@@ -734,7 +752,7 @@ async def test_exit_removes_the_aborting_listener(
 
     async with apify_event_manager:
         async with Actor:
-            await Actor.start('some-actor', name='scrape-eu', abort_with_parent=True)
+            await Actor.start('some-actor', run_name='scrape-eu', abort_with_parent=True)
         apify_event_manager.emit(event=Event.ABORTING, event_data=EventAbortingData())
         await apify_event_manager.wait_for_all_listeners_to_complete()
 
@@ -750,7 +768,7 @@ async def test_removing_all_aborting_listeners_keeps_aborting_child_runs(
     apify_client_async_patcher.patch('run', 'abort', return_value=None)
 
     async with Actor:
-        await Actor.start('some-actor', name='scrape-eu', abort_with_parent=True)
+        await Actor.start('some-actor', run_name='scrape-eu', abort_with_parent=True)
         apify_event_manager.off(event=Event.ABORTING)
         apify_event_manager.emit(event=Event.ABORTING, event_data=EventAbortingData())
         await apify_event_manager.wait_for_all_listeners_to_complete()

@@ -1286,6 +1286,7 @@ class _ActorType:
         wait: timedelta | None = None,
         token: str | None = None,
         run_name: str | None = None,
+        abort_with_parent: bool = False,
     ) -> Run:
         """Start an Actor task on the Apify Platform and wait for it to finish before returning.
 
@@ -1317,10 +1318,16 @@ class _ActorType:
                 resurrected, and a new run is started only when nothing is recorded under the name, or the recorded
                 run `FAILED` or no longer exists. The name is bound to `task_id` exactly as passed, so reusing it with
                 any other value, or for an Actor, raises a `ValueError`.
+            abort_with_parent: If true, the child run is gracefully aborted when this Actor run is gracefully
+                aborted. It requires `run_name`, and the value is recorded under it, replacing the one from an earlier
+                call. A hard abort, a timeout or a crash of this Actor run leaves the child running.
 
         Returns:
             Info about the started Actor run.
         """
+        if abort_with_parent and run_name is None:
+            raise ValueError('`abort_with_parent` requires `run_name`, since only named child runs are tracked.')
+
         client = self.new_client(token=token) if token else self.apify_client
 
         if timeout == 'inherit':
@@ -1363,7 +1370,7 @@ class _ActorType:
                 restart_on_error=restart_on_error,
                 memory_mbytes=memory_mbytes,
                 run_timeout=task_call_timeout,
-                abort_with_parent=False,
+                abort_with_parent=abort_with_parent,
             )
             run = await self._wait_for_child_run(
                 client.run(started_run.id), started_run, wait=wait, logger=None, from_start=False

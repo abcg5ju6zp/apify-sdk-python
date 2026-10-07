@@ -111,7 +111,7 @@ async def test_named_child_run_is_aborted_with_parent(
                 return
 
             actor_id = Actor.configuration.actor_id or ''
-            await Actor.start(actor_id=actor_id, run_input={'is_child': True}, name='child', abort_with_parent=True)
+            await Actor.start(actor_id=actor_id, run_input={'is_child': True}, run_name='child', abort_with_parent=True)
             await asyncio.sleep(300)
 
     actor = await make_actor(label='child-run-abort-with-parent', main_func=main)
