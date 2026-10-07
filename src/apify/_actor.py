@@ -951,7 +951,7 @@ class _ActorType:
         timeout: timedelta | Literal['inherit'] | None = None,
         force_permission_level: ActorPermissionLevel | None = None,
         webhooks: list[Webhook] | None = None,
-        name: str | None = None,
+        run_name: str | None = None,
         abort_with_parent: bool = False,
     ) -> Run:
         """Run an Actor on the Apify platform.
@@ -979,21 +979,21 @@ class _ActorType:
             webhooks: Optional ad-hoc webhooks (https://docs.apify.com/webhooks/ad-hoc-webhooks) associated with
                 the Actor run which can be used to receive a notification, e.g. when the Actor finished or failed.
                 If you already have a webhook set up for the Actor or task, you do not have to add it again here.
-            name: Optional name of the child run, unique within this Actor run. A named run is recorded in the
+            run_name: Optional name of the child run, unique within this Actor run. A named run is recorded in the
                 default key-value store, so after a migration or resurrection of this Actor the same call reattaches
                 to the recorded run. A `SUCCEEDED` run is returned as is, an `ABORTED` or `TIMED-OUT` one is
                 resurrected, and a new run is started only when nothing is recorded under the name, or the recorded
                 run `FAILED` or no longer exists. The name is bound to `actor_id` exactly as passed, so reusing it with
-                any other value raises a `ValueError`.
+                any other value, or for a task, raises a `ValueError`.
             abort_with_parent: If true, the child run is gracefully aborted when this Actor run is gracefully
-                aborted. It requires `name`, and the value is recorded under it, replacing the one from an earlier
+                aborted. It requires `run_name`, and the value is recorded under it, replacing the one from an earlier
                 call. A hard abort, a timeout or a crash of this Actor run leaves the child running.
 
         Returns:
             Info about the started Actor run
         """
-        if abort_with_parent and name is None:
-            raise ValueError('`abort_with_parent` requires `name`, since only named child runs are tracked.')
+        if abort_with_parent and run_name is None:
+            raise ValueError('`abort_with_parent` requires `run_name`, since only named child runs are tracked.')
 
         client = self.new_client(token=token) if token else self.apify_client
 
@@ -1020,11 +1020,11 @@ class _ActorType:
             webhooks=to_client_representations(webhooks),
         )
 
-        if name is None:
+        if run_name is None:
             return await start_run()
 
         run, _ = await self._find_or_start_child_run(
-            name,
+            run_name,
             actor_id=actor_id,
             client=client,
             start_run=start_run,
@@ -1091,7 +1091,7 @@ class _ActorType:
         webhooks: list[Webhook] | None = None,
         wait: timedelta | None = None,
         logger: logging.Logger | Literal['default'] | None = 'default',
-        name: str | None = None,
+        run_name: str | None = None,
         abort_with_parent: bool = False,
     ) -> Run:
         """Start an Actor on the Apify Platform and wait for it to finish before returning.
@@ -1122,21 +1122,21 @@ class _ActorType:
             logger: Logger used to redirect logs from the Actor run. Using "default" literal means that a predefined
                 default logger will be used. Setting `None` will disable any log propagation. Passing custom logger
                 will redirect logs to the provided logger.
-            name: Optional name of the child run, unique within this Actor run. A named run is recorded in the
+            run_name: Optional name of the child run, unique within this Actor run. A named run is recorded in the
                 default key-value store, so after a migration or resurrection of this Actor the same call reattaches
                 to the recorded run. A `SUCCEEDED` run is returned as is, an `ABORTED` or `TIMED-OUT` one is
                 resurrected, and a new run is started only when nothing is recorded under the name, or the recorded
                 run `FAILED` or no longer exists. The name is bound to `actor_id` exactly as passed, so reusing it with
-                any other value raises a `ValueError`.
+                any other value, or for a task, raises a `ValueError`.
             abort_with_parent: If true, the child run is gracefully aborted when this Actor run is gracefully
-                aborted. It requires `name`, and the value is recorded under it, replacing the one from an earlier
+                aborted. It requires `run_name`, and the value is recorded under it, replacing the one from an earlier
                 call. A hard abort, a timeout or a crash of this Actor run leaves the child running.
 
         Returns:
             Info about the started Actor run.
         """
-        if abort_with_parent and name is None:
-            raise ValueError('`abort_with_parent` requires `name`, since only named child runs are tracked.')
+        if abort_with_parent and run_name is None:
+            raise ValueError('`abort_with_parent` requires `run_name`, since only named child runs are tracked.')
 
         client = self.new_client(token=token) if token else self.apify_client
 
@@ -1151,7 +1151,7 @@ class _ActorType:
 
         actor_client = client.actor(actor_id)
 
-        if name is None:
+        if run_name is None:
             run = await actor_client.call(
                 run_input=run_input,
                 content_type=content_type,
@@ -1167,7 +1167,7 @@ class _ActorType:
             )
         else:
             started_run, is_new = await self._find_or_start_child_run(
-                name,
+                run_name,
                 actor_id=actor_id,
                 client=client,
                 start_run=partial(
@@ -1205,7 +1205,8 @@ class _ActorType:
         self,
         name: str,
         *,
-        actor_id: str,
+        actor_id: str | None = None,
+        task_id: str | None = None,
         client: ApifyClientAsync,
         start_run: Callable[[], Awaitable[Run]],
         build: str | None,
@@ -1218,6 +1219,7 @@ class _ActorType:
         return await self._child_run_registry.find_or_start(
             name,
             actor_id=actor_id,
+            task_id=task_id,
             client=client,
             start_run=start_run,
             resurrect_run=lambda run_client: run_client.resurrect(
@@ -1263,9 +1265,9 @@ class _ActorType:
     async def child_runs(self) -> dict[str, ChildRunInfo]:
         """Get the named child runs of this Actor run, with their current state.
 
-        Every run started by `Actor.start` or `Actor.call` with a `name` is included, even one started before a
-        migration or resurrection of this Actor run. Runs started without a `name` are not tracked. Each run is fetched
-        from the API when this method is called, so the result is a snapshot.
+        Every run started by `Actor.start`, `Actor.call` or `Actor.call_task` with a `run_name` is included, even one
+        started before a migration or resurrection of this Actor run. Runs started without a `run_name` are not
+        tracked. Each run is fetched from the API when this method is called, so the result is a snapshot.
 
         Returns:
             The child runs by name.
@@ -1300,6 +1302,8 @@ class _ActorType:
         webhooks: list[Webhook] | None = None,
         wait: timedelta | None = None,
         token: str | None = None,
+        run_name: str | None = None,
+        abort_with_parent: bool = False,
     ) -> Run:
         """Start an Actor task on the Apify Platform and wait for it to finish before returning.
 
@@ -1325,10 +1329,22 @@ class _ActorType:
                 be used to receive a notification, e.g. when the Actor finished or failed. If you already have
                 a webhook set up for the Actor, you do not have to add it again here.
             wait: The maximum time the server waits for the run to finish. If not provided, waits indefinitely.
+            run_name: Optional name of the child run, unique within this Actor run. A named run is recorded in the
+                default key-value store, so after a migration or resurrection of this Actor the same call reattaches
+                to the recorded run. A `SUCCEEDED` run is returned as is, an `ABORTED` or `TIMED-OUT` one is
+                resurrected, and a new run is started only when nothing is recorded under the name, or the recorded
+                run `FAILED` or no longer exists. The name is bound to `task_id` exactly as passed, so reusing it with
+                any other value, or for an Actor, raises a `ValueError`.
+            abort_with_parent: If true, the child run is gracefully aborted when this Actor run is gracefully
+                aborted. It requires `run_name`, and the value is recorded under it, replacing the one from an earlier
+                call. A hard abort, a timeout or a crash of this Actor run leaves the child running.
 
         Returns:
             Info about the started Actor run.
         """
+        if abort_with_parent and run_name is None:
+            raise ValueError('`abort_with_parent` requires `run_name`, since only named child runs are tracked.')
+
         client = self.new_client(token=token) if token else self.apify_client
 
         if timeout == 'inherit':
@@ -1341,15 +1357,41 @@ class _ActorType:
             raise ValueError(f'Invalid timeout {timeout!r}: expected `None`, `"inherit"`, or a `timedelta`.')
 
         task_client = client.task(task_id)
-        run = await task_client.call(
-            task_input=task_input,
-            build=build,
-            restart_on_error=restart_on_error,
-            memory_mbytes=memory_mbytes,
-            run_timeout=task_call_timeout,
-            webhooks=to_client_representations(webhooks),
-            wait_duration=wait,
-        )
+
+        if run_name is None:
+            run = await task_client.call(
+                task_input=task_input,
+                build=build,
+                restart_on_error=restart_on_error,
+                memory_mbytes=memory_mbytes,
+                run_timeout=task_call_timeout,
+                webhooks=to_client_representations(webhooks),
+                wait_duration=wait,
+            )
+        else:
+            started_run, _ = await self._find_or_start_child_run(
+                run_name,
+                task_id=task_id,
+                client=client,
+                start_run=partial(
+                    task_client.start,
+                    task_input=task_input,
+                    build=build,
+                    restart_on_error=restart_on_error,
+                    memory_mbytes=memory_mbytes,
+                    run_timeout=task_call_timeout,
+                    webhooks=to_client_representations(webhooks),
+                ),
+                build=build,
+                max_total_charge_usd=None,
+                restart_on_error=restart_on_error,
+                memory_mbytes=memory_mbytes,
+                run_timeout=task_call_timeout,
+                abort_with_parent=abort_with_parent,
+            )
+            run = await self._wait_for_child_run(
+                client.run(started_run.id), started_run, wait=wait, logger=None, from_start=False
+            )
 
         if run is None:
             raise RuntimeError(f'Failed to call Task with ID "{task_id}".')
