@@ -16,6 +16,13 @@ from apify._actor import Actor
 from apify._configuration import Configuration
 from apify._consts import ActorEnvVars, ApifyEnvVars
 from apify._proxy_configuration import ProxyConfiguration, ProxyInfo
+from apify._proxy_lease import (
+    ProxyExitUncertainError,
+    ProxyLeaseError,
+    ProxyLeaseOwnershipLostError,
+    ProxyLeasePersistError,
+    ProxyNotReadyError,
+)
 from apify._webhook import Webhook
 from apify.events._types import ActorEventTypes
 
@@ -35,7 +42,12 @@ __all__ = [
     'EventPersistStateData',
     'EventSystemInfoData',
     'ProxyConfiguration',
+    'ProxyExitUncertainError',
     'ProxyInfo',
+    'ProxyLeaseError',
+    'ProxyLeaseOwnershipLostError',
+    'ProxyLeasePersistError',
+    'ProxyNotReadyError',
     'Request',
     'Webhook',
     'WebhookEventType',

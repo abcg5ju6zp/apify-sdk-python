@@ -165,3 +165,45 @@ async def test_proxy_configuration_with_actor_proxy_input(
     assert call_mock.call_count == 3
 
     await Actor.exit()
+
+
+@pytest.mark.usefixtures('patched_impit_client')
+async def test_sticky_session_lease_persisted_in_default_kvs(
+    monkeypatch: pytest.MonkeyPatch,
+    httpserver: HTTPServer,
+) -> None:
+    dummy_proxy_status_url = str(httpserver.url_for('/')).removesuffix('/')
+    monkeypatch.setenv(ApifyEnvVars.PROXY_STATUS_URL.value, dummy_proxy_status_url)
+
+    httpserver.expect_request('/').respond_with_json(
+        {
+            'connected': True,
+            'connectionError': None,
+            'isManInTheMiddle': False,
+            'clientIp': '1.2.3.4',
+        },
+        status=200,
+    )
+
+    await Actor.init()
+
+    proxy_configuration = await Actor.create_proxy_configuration(password=DUMMY_PASSWORD, groups=['GROUP1'])
+    assert proxy_configuration is not None
+
+    proxy_info = await proxy_configuration.new_proxy_info('sticky_session_1')
+    assert proxy_info is not None
+    assert proxy_info.lease_generation == 1
+    assert proxy_info.session_id == 'sticky_session_1'
+    assert proxy_info.session_rotated is False
+
+    # The lease checkpoint is persisted in the run's default key-value store, which survives
+    # migrations and reboots.
+    kvs = await Actor.open_key_value_store()
+    checkpoint = await kvs.get_value('APIFY_PROXY_SESSION_LEASES')
+    assert checkpoint is not None
+    assert checkpoint['leases']['sticky_session_1']['exit_id'] == '1.2.3.4'
+    assert checkpoint['leases']['sticky_session_1']['state'] == 'active'
+
+    await proxy_configuration.persist_proxy_leases()
+
+    await Actor.exit()

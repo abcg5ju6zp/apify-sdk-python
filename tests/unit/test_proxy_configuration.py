@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import re
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
@@ -14,6 +15,11 @@ from apify_client import ApifyClientAsync
 
 from apify._consts import ApifyEnvVars
 from apify._proxy_configuration import ProxyConfiguration
+from apify._proxy_lease import (
+    ProxyLeaseOwnershipLostError,
+    ProxyLeasePersistError,
+    ProxyNotReadyError,
+)
 
 if TYPE_CHECKING:
     from pytest_httpserver import HTTPServer
@@ -320,6 +326,9 @@ async def test_new_proxy_info_basic_construction() -> None:
         'proxy_tier': None,
         'session_id': None,
         'scheme': 'http',
+        'logical_session_id': None,
+        'lease_generation': None,
+        'session_rotated': False,
     }
 
 
@@ -601,3 +610,226 @@ async def test_proxy_urls_with_apify_domain_warns(caplog: pytest.LogCaptureFixtu
     caplog.set_level('WARNING')
     ProxyConfiguration(proxy_urls=['http://proxy.apify.com:8000'])
     assert any('Some Apify proxy features may work incorrectly' in msg for msg in caplog.messages)
+
+
+class _InMemoryLeaseKvs:
+    """Minimal KVS stand-in for lease checkpoints, emulating JSON (de)serialization."""
+
+    def __init__(self, *, fail_saves: bool = False) -> None:
+        self._copy = copy.deepcopy
+        self.data: dict[str, Any] = {}
+        self.fail_saves = fail_saves
+        self.accessed = False
+
+    async def get_value(self, key: str) -> Any:
+        self.accessed = True
+        return self._copy(self.data.get(key))
+
+    async def set_value(self, key: str, value: Any) -> None:
+        self.accessed = True
+        if self.fail_saves:
+            raise RuntimeError('KVS is unavailable')
+        self.data[key] = self._copy(value)
+
+
+def _make_status_patcher(monkeypatch: pytest.MonkeyPatch, cfg: ProxyConfiguration, results: list) -> Any:
+    """Replace the status fetcher with a scripted sequence of status documents (or `None`)."""
+    queue = list(results)
+
+    async def fetch_proxy_status(proxy_url: str) -> dict[str, Any] | None:
+        if not queue:
+            raise AssertionError(f'Unexpected proxy status query: {proxy_url}')
+        return queue.pop(0)
+
+    monkeypatch.setattr(cfg, '_fetch_proxy_status', fetch_proxy_status)
+    return fetch_proxy_status
+
+
+def _status_ok(exit_id: str) -> dict[str, Any]:
+    return {'connected': True, 'connectionError': None, 'isManInTheMiddle': False, 'clientIp': exit_id}
+
+
+async def test_leased_session_is_persisted_and_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    kvs = _InMemoryLeaseKvs()
+
+    async def open_kvs() -> _InMemoryLeaseKvs:
+        return kvs
+
+    cfg = ProxyConfiguration(password='pw', groups=['RESIDENTIAL'], country_code='US', _lease_kvs_opener=open_kvs)
+    _make_status_patcher(monkeypatch, cfg, [_status_ok('1.1.1.1')])
+
+    info = await cfg.new_proxy_info('sess1')
+
+    assert info is not None
+    assert info.url == 'http://groups-RESIDENTIAL,session-sess1,country-US:pw@proxy.apify.com:8000'
+    assert info.session_id == 'sess1'
+    assert info.logical_session_id == 'sess1'
+    assert info.lease_generation == 1
+    assert info.session_rotated is False
+
+    assert kvs.data['APIFY_PROXY_SESSION_LEASES']['leases']['sess1']['exit_id'] == '1.1.1.1'
+
+
+async def test_leased_session_restore_and_fencing_after_reboot(monkeypatch: pytest.MonkeyPatch) -> None:
+    kvs = _InMemoryLeaseKvs()
+
+    async def open_kvs() -> _InMemoryLeaseKvs:
+        return kvs
+
+    old_cfg = ProxyConfiguration(password='pw', groups=['G1'], _lease_kvs_opener=open_kvs)
+    _make_status_patcher(monkeypatch, old_cfg, [_status_ok('1.1.1.1')])
+    old_info = await old_cfg.new_proxy_info('sess1')
+    assert old_info is not None
+    assert old_info.lease_generation == 1
+
+    # New process (migration/reboot) takes over the checkpoint and restores the original exit.
+    new_cfg = ProxyConfiguration(password='pw', groups=['G1'], _lease_kvs_opener=open_kvs)
+    _make_status_patcher(monkeypatch, new_cfg, [_status_ok('1.1.1.1')])
+    restored = await new_cfg.new_proxy_info('sess1')
+    assert restored is not None
+    assert restored.session_rotated is False
+    assert restored.session_id == 'sess1'
+    assert restored.lease_generation == 1
+    assert restored.url == old_info.url
+
+    # The old process is fenced out and can no longer sign URLs, even though it knows the session id.
+    with pytest.raises(ProxyLeaseOwnershipLostError):
+        await old_cfg.new_proxy_info('sess1')
+
+
+async def test_leased_session_reports_rotation_when_exit_switches(monkeypatch: pytest.MonkeyPatch) -> None:
+    kvs = _InMemoryLeaseKvs()
+
+    async def open_kvs() -> _InMemoryLeaseKvs:
+        return kvs
+
+    old_cfg = ProxyConfiguration(password='pw', groups=['G1'], _lease_kvs_opener=open_kvs)
+    _make_status_patcher(monkeypatch, old_cfg, [_status_ok('1.1.1.1')])
+    await old_cfg.new_proxy_info('sess1')
+
+    new_cfg = ProxyConfiguration(password='pw', groups=['G1'], _lease_kvs_opener=open_kvs)
+    _make_status_patcher(
+        monkeypatch,
+        new_cfg,
+        [_status_ok('9.9.9.9'), _status_ok('9.9.9.9')],
+    )
+    rotated_info = await new_cfg.new_proxy_info('sess1')
+    assert rotated_info is not None
+    assert rotated_info.session_rotated is True
+    assert rotated_info.logical_session_id == 'sess1'
+    assert rotated_info.session_id == 'sess1~g2'
+    assert rotated_info.lease_generation == 2
+    assert 'session-sess1~g2' in rotated_info.url
+
+
+async def test_leased_session_fails_closed_when_checkpoint_cannot_be_saved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kvs = _InMemoryLeaseKvs(fail_saves=True)
+
+    async def open_kvs() -> _InMemoryLeaseKvs:
+        return kvs
+
+    cfg = ProxyConfiguration(password='pw', groups=['G1'], _lease_kvs_opener=open_kvs)
+
+    status_queries = 0
+
+    async def fetch_proxy_status(_proxy_url: str) -> dict[str, Any]:
+        nonlocal status_queries
+        status_queries += 1
+        return _status_ok('1.1.1.1')
+
+    monkeypatch.setattr(cfg, '_fetch_proxy_status', fetch_proxy_status)
+
+    with pytest.raises(ProxyLeasePersistError):
+        await cfg.new_proxy_info('sess1')
+
+    assert status_queries == 0  # no exit is contacted before the lease is safely persisted
+
+
+async def test_leased_session_without_password_stays_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(ApifyEnvVars.PROXY_PASSWORD.value, raising=False)
+    monkeypatch.delenv(ApifyEnvVars.TOKEN.value, raising=False)
+
+    async def open_kvs() -> _InMemoryLeaseKvs:
+        return _InMemoryLeaseKvs()
+
+    cfg = ProxyConfiguration(groups=['G1'], _lease_kvs_opener=open_kvs)
+
+    with pytest.raises(ProxyNotReadyError):
+        await cfg.new_proxy_info('sess1')
+
+
+async def test_sessionless_rotation_does_not_touch_lease_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    kvs = _InMemoryLeaseKvs(fail_saves=True)
+
+    async def open_kvs() -> _InMemoryLeaseKvs:
+        return kvs
+
+    cfg = ProxyConfiguration(password='pw', groups=['G1'], _lease_kvs_opener=open_kvs)
+
+    assert await cfg.new_url() == 'http://groups-G1:pw@proxy.apify.com:8000'
+    info = await cfg.new_proxy_info()
+    assert info is not None
+    assert info.lease_generation is None
+    assert info.session_rotated is False
+    assert kvs.accessed is False
+
+
+async def test_quarantine_and_persist_lease_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    kvs = _InMemoryLeaseKvs()
+
+    async def open_kvs() -> _InMemoryLeaseKvs:
+        return kvs
+
+    cfg = ProxyConfiguration(password='pw', groups=['G1'], _lease_kvs_opener=open_kvs)
+    _make_status_patcher(monkeypatch, cfg, [_status_ok('1.1.1.1'), _status_ok('2.2.2.2')])
+
+    await cfg.new_proxy_info('sess1')
+    await cfg.persist_proxy_leases()
+    await cfg.quarantine_session('sess1')
+
+    assert kvs.data['APIFY_PROXY_SESSION_LEASES']['leases']['sess1']['state'] == 'quarantined'
+
+    rotated = await cfg.new_proxy_info('sess1')
+    assert rotated is not None
+    assert rotated.session_rotated is True
+    assert rotated.session_id == 'sess1~g2'
+
+
+async def test_lease_helpers_are_noop_without_opener() -> None:
+    cfg = ProxyConfiguration(password='pw', groups=['G1'])
+    await cfg.quarantine_session('sess1')
+    await cfg.persist_proxy_leases()
+
+
+@pytest.mark.usefixtures('patched_impit_client')
+async def test_leased_session_end_to_end_status_plumbing(
+    monkeypatch: pytest.MonkeyPatch,
+    httpserver: HTTPServer,
+) -> None:
+    dummy_proxy_status_url = str(httpserver.url_for('/')).removesuffix('/')
+    monkeypatch.setenv(ApifyEnvVars.PROXY_STATUS_URL.value, dummy_proxy_status_url)
+
+    httpserver.expect_request('/').respond_with_json(
+        {
+            'connected': True,
+            'connectionError': None,
+            'isManInTheMiddle': False,
+            'clientIp': '1.2.3.4',
+        },
+        status=200,
+    )
+
+    kvs = _InMemoryLeaseKvs()
+
+    async def open_kvs() -> _InMemoryLeaseKvs:
+        return kvs
+
+    cfg = ProxyConfiguration(password='pw', groups=['G1'], _lease_kvs_opener=open_kvs)
+    info = await cfg.new_proxy_info('sess1')
+
+    assert info is not None
+    assert info.lease_generation == 1
+    assert info.url == 'http://groups-G1,session-sess1:pw@proxy.apify.com:8000'
+    assert kvs.data['APIFY_PROXY_SESSION_LEASES']['leases']['sess1']['exit_id'] == '1.2.3.4'

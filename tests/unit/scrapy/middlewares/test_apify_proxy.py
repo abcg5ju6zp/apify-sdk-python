@@ -8,7 +8,7 @@ from scrapy.core.downloader.handlers.http11 import TunnelError
 from scrapy.crawler import Crawler
 from scrapy.exceptions import NotConfigured
 
-from apify import ProxyConfiguration
+from apify import ProxyConfiguration, ProxyInfo
 from apify.scrapy.middlewares import ApifyHttpProxyMiddleware
 
 
@@ -119,10 +119,10 @@ async def test_process_request_with_proxy(
     expected_exception: type[Exception] | None,
     expected_request_header: bytes,
 ) -> None:
-    async def mock_get_new_proxy_url() -> ParseResult:
-        return urlparse(proxy_url)
+    async def mock_get_proxy_for_request() -> tuple[ParseResult, ProxyInfo | None]:
+        return urlparse(proxy_url), None
 
-    monkeypatch.setattr(middleware, '_get_new_proxy_url', mock_get_new_proxy_url)
+    monkeypatch.setattr(middleware, '_get_proxy_for_request', mock_get_proxy_for_request)
 
     if expected_exception is None:
         await middleware.process_request(dummy_request)
@@ -145,3 +145,87 @@ def test_handles_exceptions(
 ) -> None:
     returned_value = middleware.process_exception(dummy_request, exception)
     assert returned_value is None
+
+
+async def test_sticky_session_goes_through_confirmed_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_configuration: ProxyConfiguration,
+) -> None:
+    middleware = ApifyHttpProxyMiddleware({'useApifyProxy': True, 'apifyProxySession': 'sess1'})
+    proxy_info = ProxyInfo(
+        url='http://session-sess1:password@proxy.apify.com:8000',
+        scheme='http',
+        hostname='proxy.apify.com',
+        port=8000,
+        username='session-sess1',
+        password='password',
+        session_id='sess1',
+        logical_session_id='sess1',
+        lease_generation=1,
+    )
+
+    async def mock_new_proxy_info(
+        session_id: str | None = None,
+        _request: object = None,
+        _proxy_tier: int | None = None,
+    ) -> ProxyInfo:
+        assert session_id == 'sess1'
+        return proxy_info
+
+    monkeypatch.setattr(proxy_configuration, 'new_proxy_info', mock_new_proxy_info)
+    middleware._proxy_cfg_internal = proxy_configuration
+
+    url, info = await middleware._get_proxy_for_request()
+
+    assert info is proxy_info
+    assert url.username == 'session-sess1'
+
+
+async def test_session_rotation_is_reported_on_request_meta(
+    monkeypatch: pytest.MonkeyPatch,
+    middleware: ApifyHttpProxyMiddleware,
+    dummy_request: Request,
+) -> None:
+    proxy_url = 'http://session-sess1~g2:password@proxy.apify.com:8000'
+    proxy_info = ProxyInfo(
+        url=proxy_url,
+        scheme='http',
+        hostname='proxy.apify.com',
+        port=8000,
+        username='session-sess1~g2',
+        password='password',
+        session_id='sess1~g2',
+        logical_session_id='sess1',
+        lease_generation=2,
+        session_rotated=True,
+    )
+
+    async def mock_get_proxy_for_request() -> tuple[ParseResult, ProxyInfo | None]:
+        return urlparse(proxy_url), proxy_info
+
+    monkeypatch.setattr(middleware, '_get_proxy_for_request', mock_get_proxy_for_request)
+
+    await middleware.process_request(dummy_request)
+
+    assert dummy_request.meta['proxy'] == proxy_url
+    assert dummy_request.meta['apify_proxy_session_rotated'] is True
+    assert dummy_request.meta['apify_proxy_session_generation'] == 2
+
+
+async def test_no_session_keeps_sessionless_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+    middleware: ApifyHttpProxyMiddleware,
+    proxy_configuration: ProxyConfiguration,
+) -> None:
+    expected_url = 'http://auto:password@proxy.apify.com:8000'
+
+    async def mock_new_url() -> str:
+        return expected_url
+
+    monkeypatch.setattr(proxy_configuration, 'new_url', mock_new_url)
+    middleware._proxy_cfg_internal = proxy_configuration
+
+    url, proxy_info = await middleware._get_proxy_for_request()
+
+    assert proxy_info is None
+    assert url.geturl() == expected_url

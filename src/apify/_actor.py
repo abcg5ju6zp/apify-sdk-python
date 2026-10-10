@@ -1528,9 +1528,21 @@ class _ActorType:
             new_url_function=new_url_function,
             _actor_config=self.configuration,
             _apify_client=self._apify_client,
+            # Sticky session leases are persisted in the run's default key-value store, which survives
+            # migrations and reboots. Custom proxy URLs rotate without leases.
+            _lease_kvs_opener=self.open_key_value_store if not (proxy_urls or new_url_function) else None,
         )
 
         await proxy_configuration.initialize()
+
+        if not (proxy_urls or new_url_function):
+            # Persist the session leases together with the other Actor state so that a migrated or rebooted
+            # process can reclaim ownership and restore the original proxy exits. A failed lease save raises
+            # from the listener, rejecting the handover.
+            async def persist_proxy_leases(_data: EventPersistStateData) -> None:
+                await proxy_configuration.persist_proxy_leases()
+
+            self.on(Event.PERSIST_STATE, persist_proxy_leases)
 
         return proxy_configuration
 

@@ -8,7 +8,6 @@ from re import Pattern
 from typing import TYPE_CHECKING, Any
 
 import impit
-from yarl import URL
 
 from crawlee.proxy_configuration import (
     ProxyConfiguration as CrawleeProxyConfiguration,
@@ -22,9 +21,16 @@ from crawlee.proxy_configuration import (
 
 from apify._configuration import Configuration
 from apify._consts import ApifyEnvVars
+from apify._proxy_lease import (
+    SESSION_ID_MAX_LENGTH,
+    ProxyLeaseManager,
+    ProxyLeaseStore,
+)
 from apify._utils import docs_group
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from apify_client import ApifyClientAsync
 
     from apify import Request
@@ -35,7 +41,6 @@ APIFY_PROXY_VALUE_REGEX = re.compile(r'^[\w._~]+$')
 COUNTRY_CODE_REGEX = re.compile(r'^[A-Z]{2}$')
 # ISO 3166-2 subdivision codes are 1-3 uppercase alphanumeric characters, e.g. 'CA', 'NSW', '9' (Wien, AT-9)
 SUBDIVISION_CODE_REGEX = re.compile(r'^[A-Z0-9]{1,3}$')
-SESSION_ID_MAX_LENGTH = 50
 
 
 def _check(
@@ -86,6 +91,19 @@ class ProxyInfo(CrawleeProxyInfo):
     the United States (`country_code='US'`).
     """
 
+    logical_session_id: str | None = None
+    """The logical session identifier requested by the caller, when sticky sessions with persisted leases are
+    used. It stays stable even if the proxy exit is rotated (`session_rotated=True`), in which case `session_id`
+    points at the new physical proxy session."""
+
+    lease_generation: int | None = None
+    """Generation of the persisted session lease backing this proxy info, starting at 1. `None` when the proxy
+    info is issued without a lease (e.g. custom proxy URLs or no session id)."""
+
+    session_rotated: bool = False
+    """`True` if the leased proxy exit was found dead or switched during issuance and the session was rotated to
+    a new generation; callers should treat site-side session state (logins, rate-limit fingerprints) as new."""
+
 
 @docs_group('Configuration')
 class ProxyConfiguration(CrawleeProxyConfiguration):
@@ -114,6 +132,7 @@ class ProxyConfiguration(CrawleeProxyConfiguration):
         tiered_proxy_urls: list[list[str | None]] | None = None,
         _actor_config: Configuration | None = None,
         _apify_client: ApifyClientAsync | None = None,
+        _lease_kvs_opener: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         """Create a ProxyConfiguration instance.
 
@@ -185,6 +204,9 @@ class ProxyConfiguration(CrawleeProxyConfiguration):
         self._country_code = country_code
         self._subdivision_code = subdivision_code
 
+        self._lease_kvs_opener = _lease_kvs_opener
+        self._lease_manager: ProxyLeaseManager | None = None
+
     async def initialize(self) -> None:
         """Check if using proxy, if so, check the access.
 
@@ -197,8 +219,7 @@ class ProxyConfiguration(CrawleeProxyConfiguration):
         `ProxyConfiguration` instance instead of calling this manually.
         """
         if self._uses_apify_proxy:
-            if not self._password:
-                await self._maybe_fetch_password()
+            await self._ensure_password()
             if not self._password:
                 raise ValueError(
                     'Apify Proxy password must be provided using the "password" constructor argument '
@@ -221,6 +242,13 @@ class ProxyConfiguration(CrawleeProxyConfiguration):
         Use it if you want to work with a rich representation of a proxy URL. If you need the URL string only,
         use `ProxyConfiguration.new_url`.
 
+        When a `session_id` is provided and the configuration was created through
+        `Actor.create_proxy_configuration()`, the session is backed by a persisted lease that is reconciled with
+        the Actor run's checkpoint before every issuance. The original proxy exit is restored while the lease is
+        valid; if the exit died or switched silently, the old lease is quarantined, a new generation is acquired
+        and the returned `ProxyInfo` reports `session_rotated=True`. No session-less fallback URL is ever returned
+        when the lease cannot be confirmed.
+
         Args:
             session_id: Represents the identifier of a proxy session (https://docs.apify.com/proxy#sessions).
                 All the HTTP requests going through the proxy with the same session identifier will use the same
@@ -236,27 +264,20 @@ class ProxyConfiguration(CrawleeProxyConfiguration):
         if session_id is not None:
             _check(session_id, label='session_id', max_length=SESSION_ID_MAX_LENGTH, pattern=APIFY_PROXY_VALUE_REGEX)
 
+        if self._uses_apify_proxy and session_id is not None:
+            lease_manager = self._get_lease_manager()
+            if lease_manager is not None:
+                return await self._new_leased_proxy_info(session_id, proxy_tier)
+
         proxy_info = await super().new_proxy_info(session_id=session_id, request=request, proxy_tier=proxy_tier)
 
         if proxy_info is None:
             return None
 
         if self._uses_apify_proxy:
-            parsed_url = URL(proxy_info.url)
-            username = self._get_username(session_id)
-
-            return ProxyInfo(
-                url=f'http://{username}:{self._password or ""}@{parsed_url.host}:{parsed_url.port}',
-                scheme='http',
-                hostname=proxy_info.hostname,
-                port=proxy_info.port,
-                username=username,
-                password=self._password or '',
-                session_id=proxy_info.session_id,
+            return self._build_apify_proxy_info(
+                physical_session_id=session_id,
                 proxy_tier=proxy_info.proxy_tier,
-                groups=self._groups,
-                country_code=self._country_code or None,
-                subdivision_code=self._subdivision_code or None,
             )
 
         return ProxyInfo(
@@ -270,31 +291,141 @@ class ProxyConfiguration(CrawleeProxyConfiguration):
             proxy_tier=proxy_info.proxy_tier,
         )
 
+    async def quarantine_session(self, session_id: str) -> None:
+        """Mark a leased sticky session's exit as unusable so the next issuance rotates to a new generation.
+
+        Call this when the target site indicates that the current exit is blocked (e.g. persistent 407/403 on
+        a sticky session). The old lease is quarantined before a new exit is acquired. Has no effect when leases
+        are not enabled (custom proxy URLs, no Actor run storage, or session-less rotation).
+        """
+        _check(session_id, label='session_id', max_length=SESSION_ID_MAX_LENGTH, pattern=APIFY_PROXY_VALUE_REGEX)
+        lease_manager = self._get_lease_manager()
+        if lease_manager is not None:
+            await lease_manager.quarantine_session(session_id)
+
+    async def persist_proxy_leases(self) -> None:
+        """Persist the current session leases to the Actor run's key-value store (migration/reboot checkpoint).
+
+        Raises `ProxyLeasePersistError` when the checkpoint cannot be saved; the handover is then rejected and
+        the restart resumes from the last successful checkpoint. Has no effect when leases are not enabled.
+        """
+        lease_manager = self._get_lease_manager()
+        if lease_manager is not None:
+            await lease_manager.handover()
+
+    def _get_lease_manager(self) -> ProxyLeaseManager | None:
+        """Return the lazily created lease manager, or `None` when session leases are not enabled."""
+        if not self._uses_apify_proxy or self._lease_kvs_opener is None:
+            return None
+        if self._lease_manager is None:
+            self._lease_manager = ProxyLeaseManager(
+                owner_run_id=self._configuration.actor_run_id,
+                groups=self._groups,
+                country_code=self._country_code,
+                subdivision_code=self._subdivision_code,
+                store=ProxyLeaseStore(self._lease_kvs_opener),
+                ensure_password=self._ensure_password,
+                build_proxy_url=self._build_apify_proxy_url,
+                fetch_proxy_status=self._fetch_proxy_status,
+            )
+        return self._lease_manager
+
+    async def _new_leased_proxy_info(self, logical_session_id: str, proxy_tier: int | None) -> ProxyInfo:
+        assert self._lease_manager is not None  # noqa: S101
+        lease, session_rotated = await self._lease_manager.issue(logical_session_id, proxy_tier)
+
+        return self._build_apify_proxy_info(
+            physical_session_id=lease.physical_session_id,
+            proxy_tier=proxy_tier,
+            logical_session_id=logical_session_id,
+            lease_generation=lease.generation,
+            session_rotated=session_rotated,
+        )
+
+    def _build_apify_proxy_info(
+        self,
+        *,
+        physical_session_id: str | None,
+        proxy_tier: int | None,
+        logical_session_id: str | None = None,
+        lease_generation: int | None = None,
+        session_rotated: bool = False,
+    ) -> ProxyInfo:
+        """Build a `ProxyInfo` for the given physical proxy session, sharing one authenticated identity."""
+        username = self._get_username(physical_session_id)
+        return ProxyInfo(
+            url=self._build_apify_proxy_url(physical_session_id, proxy_tier),
+            scheme='http',
+            hostname=self._hostname,
+            port=self._port,
+            username=username,
+            password=self._password or '',
+            session_id=physical_session_id,
+            proxy_tier=proxy_tier,
+            groups=self._groups,
+            country_code=self._country_code or None,
+            subdivision_code=self._subdivision_code or None,
+            logical_session_id=logical_session_id,
+            lease_generation=lease_generation,
+            session_rotated=session_rotated,
+        )
+
+    def _build_apify_proxy_url(self, physical_session_id: str | None, _proxy_tier: int | None) -> str:
+        """Build the authenticated Apify Proxy URL for a physical session.
+
+        Authentication refreshes (`self._password`) never change the session identity encoded in the username.
+        """
+        username = self._get_username(physical_session_id)
+        return f'http://{username}:{self._password or ""}@{self._hostname}:{self._port}'
+
+    async def _ensure_password(self) -> str:
+        """Return the proxy password, lazily fetching it once from the Apify API when possible."""
+        if not self._password:
+            await self._maybe_fetch_password()
+        return self._password or ''
+
     async def _maybe_fetch_password(self) -> None:
         token = self._configuration.token
 
         if token and self._apify_client:
-            user_info = await self._apify_client.user().get()
+            try:
+                user_info = await self._apify_client.user().get()
+            except Exception:
+                logger.warning('Failed to fetch the Apify Proxy password from the Apify API.')
+                return
             if user_info and (proxy := getattr(user_info, 'proxy', None)):
+                # Refreshing the password must not alter any established session identity.
                 self._password = proxy.password
 
-    async def _check_access(self) -> None:
+    async def _fetch_proxy_status(self, proxy_url: str) -> dict[str, Any] | None:
+        """Query the Apify Proxy status endpoint through the given proxy URL.
+
+        Returns the parsed status document, or `None` when the status cannot be determined (the caller must
+        re-verify the same exit rather than rotating).
+        """
         proxy_status_url = f'{self._configuration.proxy_status_url}/?format=json'
+
+        status: dict[str, Any] | None = None
+        async with impit.AsyncClient(proxy=proxy_url, timeout=10) as client:
+            for _ in range(2):
+                try:
+                    response = await client.get(proxy_status_url)
+                    parsed = json.loads(response.text)
+                    if isinstance(parsed, dict):
+                        status = parsed
+                        break
+                except Exception:  # noqa: S110
+                    # retry on connection or parsing errors
+                    pass
+        return status
+
+    async def _check_access(self) -> None:
         proxy_info = await self.new_proxy_info()
 
         if proxy_info is None:
             return
 
-        status = None
-        async with impit.AsyncClient(proxy=proxy_info.url, timeout=10) as client:
-            for _ in range(2):
-                try:
-                    response = await client.get(proxy_status_url)
-                    status = json.loads(response.text)
-                    break
-                except Exception:  # noqa: S110
-                    # retry on connection errors
-                    pass
+        status = await self._fetch_proxy_status(proxy_info.url)
 
         if status:
             if not status['connected']:
