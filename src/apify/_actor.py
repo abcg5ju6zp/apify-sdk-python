@@ -39,6 +39,7 @@ from apify._configuration import Configuration
 from apify._consts import EVENT_LISTENERS_TIMEOUT, EXIT_CODE_ERROR_USER_FUNCTION_THREW, ActorEnvVars, ApifyEnvVars
 from apify._crypto import decrypt_input_secrets, load_private_key
 from apify._proxy_configuration import ProxyConfiguration
+from apify._state_checkpoints import StateCheckpointManager
 from apify._utils import docs_group, docs_name, ensure_context, get_system_info, is_running_in_ipython
 from apify._webhook import to_client_representations
 from apify.events import ApifyEventManager, EventManager, LocalEventManager
@@ -148,8 +149,9 @@ class _ActorType:
 
         self._apify_client: ApifyClientAsync | None = None
 
-        # Keep track of all used state stores to persist their values on exit
-        self._use_state_stores: set[str | None] = set()
+        # Coordinates atomic persistence of states registered via `use_state`. Created lazily so
+        # Actors that never call `use_state` are not affected at all.
+        self._state_checkpoint_manager: StateCheckpointManager | None = None
 
         self._active = False
         """Whether the Actor instance is currently active (initialized and within context)."""
@@ -1546,6 +1548,13 @@ class _ActorType:
 
         Values can be modified by simply using the assignment operator.
 
+        When states are registered in multiple key-value stores, they are persisted as a single
+        atomic checkpoint: the values are frozen, written to generation-scoped temporary keys and
+        committed through a manifest. A restart or migration restores every store from the last
+        complete checkpoint, so a process that stops mid-persistence cannot leave a mix of values
+        from different points in time. With a single key-value store the value is persisted directly
+        to its key, exactly as before.
+
         Args:
             default_value: The default value to initialize the state if it is not already set.
             key: The key in the key-value store where the state is stored. If not provided, a default key is used.
@@ -1555,21 +1564,15 @@ class _ActorType:
         Returns:
             The state dictionary with automatic persistence.
         """
-        self._use_state_stores.add(kvs_name)
-        kvs = await self.open_key_value_store(name=kvs_name)
-        return await kvs.get_auto_saved_value(key or self._ACTOR_STATE_KEY, default_value)
+        if self._state_checkpoint_manager is None:
+            self._state_checkpoint_manager = StateCheckpointManager(self)
+        return await self._state_checkpoint_manager.register(
+            default_value, key=key or self._ACTOR_STATE_KEY, kvs_name=kvs_name
+        )
 
     async def _save_actor_state(self) -> None:
-        async def safe_persist(kvs_name: str | None) -> None:
-            try:
-                store = await self.open_key_value_store(name=kvs_name)
-                await store.persist_autosaved_values()
-            except Exception:
-                self.log.exception('Failed to persist auto-saved values', extra={'kvs_name': kvs_name})
-
-        async with asyncio.TaskGroup() as tg:
-            for kvs_name in self._use_state_stores:
-                tg.create_task(safe_persist(kvs_name))
+        if self._state_checkpoint_manager is not None:
+            await self._state_checkpoint_manager.flush(reason='actor-exit')
 
     def _get_default_exit_process(self) -> bool:
         """Return False for IPython and Scrapy environments, True otherwise."""
